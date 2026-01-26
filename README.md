@@ -1,6 +1,6 @@
 # Minimal Agent Framework
 
-A lightweight, educational agent framework built with LangGraph. Demonstrates core agent patterns including explicit state management, tool orchestration, guardrails, and policy-driven decision making.
+A lightweight agent framework built with LangGraph. Demonstrates core agent patterns including explicit state management, tool orchestration, guardrails, and policy-driven decision making.
 
 ## Features
 
