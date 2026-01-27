@@ -9,7 +9,7 @@ from agent.lg_state import LGState
 
 def main() -> None:
     # The question/task for the agent to solve (modify this to test different inputs)
-    question = "What is LangGraph?"  # change me
+    question = "2+2"  # change me
 
     # Initialize the agent's state dictionary with all required fields
     state: LGState = {
@@ -33,15 +33,15 @@ def main() -> None:
         "tool_request": None,           # Current tool call request from the LLM
         "repaired_tool_request": None,  # Tool request after repair (if validation failed)
         "tool_results": [],             # Results from executed tools
-        "tool_fail_count": 2,           # Number of consecutive tool failures
+        "tool_fail_count": 0,           # Number of consecutive tool failures
         "tool_fail_cap": 4,             # Max failures before giving up on a tool
 
         # --- Tool budget ---
         "tool_calls": 0,
-        "tool_call_cap": 3,
+        "tool_call_cap": 5,
 
         "tool_latency_ms": 0,
-        "tool_latency_cap_ms": 2500,
+        "tool_latency_cap_ms": 10,
 
         # --- Error handling ---
         "last_error": None,             # Most recent error message (for debugging/repair)

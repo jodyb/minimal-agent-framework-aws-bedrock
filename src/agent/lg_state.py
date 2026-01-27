@@ -82,5 +82,5 @@ class LGState(TypedDict):
     # -------------------------------------------------------------------------
     tool_calls: int           # Total number of tool calls made this session
     tool_call_cap: int        # Max tool calls allowed (prevents runaway execution)
-    tool_latency_ms: int      # Cumulative latency of all tool executions (ms)
+    tool_latency_ms: int      # Cumulative latency of all tool executions (ms) - estimated at this time
     tool_latency_cap_ms: int  # Max total latency budget (stops slow tool chains)

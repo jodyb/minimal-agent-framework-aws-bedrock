@@ -347,6 +347,16 @@ def tool_node(state: LGState) -> Dict[str, Any]:
     # Update failure counter: increment on failure, reset on success
     updates["tool_fail_count"] = state["tool_fail_count"] + 1 if failed else 0
 
+    # Track tool budget consumption
+    updates["tool_calls"] = state["tool_calls"] + 1
+    # Only add latency if we found a valid tool with a spec
+    if tool_name and not failed:
+        try:
+            spec = get_tool(tool_name)
+            updates["tool_latency_ms"] = state["tool_latency_ms"] + spec.get("latency_ms", 0)
+        except Exception:
+            pass  # Tool not found, skip latency tracking
+
     return updates
 
 # =============================================================================
@@ -483,12 +493,67 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                         "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: calculator error"],
                     }
 
-        # No result yet - call calculator
+        # No result yet - check budget then call calculator
+        tool_budget_exhausted = (
+            state["tool_calls"] >= state["tool_call_cap"] or
+            state["tool_latency_ms"] >= state["tool_latency_cap_ms"]
+        )
+        if tool_budget_exhausted:
+            return {
+                "step_count": step_count,
+                "next": "STOP",
+                "reasoning_steps": state["reasoning_steps"] + [
+                    f"[step {step_count}] STOP: tool budget exhausted "
+                    f"(calls={state['tool_calls']}/{state['tool_call_cap']}, "
+                    f"latency={state['tool_latency_ms']}/{state['tool_latency_cap_ms']}ms)",
+                    "ANSWER: I couldn't complete this request because the tool budget has been exhausted.",
+                ],
+            }
         return {
             "step_count": step_count,
             "next": "TOOL",
             "tool_request": {"tool": "calculator", "args": {"expression": q}},
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → TOOL (calculator)"],
+        }
+
+    # =========================================================================
+    # TOOL FAILURE RECOVERY (must run before planning to avoid infinite loops)
+    # =========================================================================
+    # If a tool failed, we need to handle it before creating new plans.
+    # Otherwise, plans get created and immediately invalidated in a loop.
+
+    # Guardrail: Too many consecutive tool failures - give up
+    if state["tool_fail_count"] >= state["tool_fail_cap"]:
+        has_evidence = bool(state["knowledge"]) or bool(state["tool_results"])
+        if has_evidence:
+            return {
+                "step_count": step_count,
+                "next": "ANSWER",
+                "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → ANSWER (best-effort after tool failures)"],
+            }
+        return {
+            "step_count": step_count,
+            "next": "STOP",
+            "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: tool_fail_cap reached"],
+        }
+
+    # Recovery: If a tool failed, try the repaired version or go to THINK for repair
+    if state["tool_fail_count"] > 0:
+        repaired = state.get("repaired_tool_request")
+        if repaired:
+            # We have a repaired tool request from THINK - try it
+            return {
+                "step_count": step_count,
+                "next": "TOOL",
+                "tool_request": repaired,
+                "repaired_tool_request": None,
+                "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → TOOL (repaired)"],
+            }
+        # No repair yet - go to THINK to generate one
+        return {
+            "step_count": step_count,
+            "next": "THINK",
+            "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → THINK (tool failed, attempting repair)"],
         }
 
     # =========================================================================
@@ -537,6 +602,7 @@ Return ONLY valid JSON in this shape:
         if plan:
             print(f"[PLAN] Created plan: {plan}")
             return {
+                "step_count": step_count,
                 "plan": plan,
                 "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] PLAN created: {plan}"],
             }
@@ -550,6 +616,7 @@ Return ONLY valid JSON in this shape:
         # If next plan step is RETRIEVE but retrieval is no longer allowed, drop the plan.
         if state["plan"][0] == "RETRIEVE" and state["retrieve_count"] >= state["retrieve_cap"]:
             return {
+                "step_count": step_count,
                 "plan": [],
                 "reasoning_steps": state["reasoning_steps"]
                 + [f"[step {step_count}] PLAN invalidated: retrieve_cap reached"],
@@ -559,10 +626,34 @@ Return ONLY valid JSON in this shape:
         # We need to handle the failure first before continuing with the plan.
         if state["plan"][0] == "TOOL" and state["tool_fail_count"] > 0:
             return {
+                "step_count": step_count,
                 "plan": [],
                 "reasoning_steps": state["reasoning_steps"]
                 + [f"[step {step_count}] PLAN invalidated: tool failure recovery active"],
             }
+
+        # If next plan step is TOOL but tool budget is exhausted, drop plan.
+        if state["plan"][0] == "TOOL":
+            tool_budget_exhausted = (
+                state["tool_calls"] >= state["tool_call_cap"] or
+                state["tool_latency_ms"] >= state["tool_latency_cap_ms"]
+            )
+            if tool_budget_exhausted:
+                has_evidence = bool(state["knowledge"]) or bool(state["tool_results"])
+                budget_msg = (
+                    f"[step {step_count}] {'ANSWER' if has_evidence else 'STOP'}: tool budget exhausted "
+                    f"(calls={state['tool_calls']}/{state['tool_call_cap']}, "
+                    f"latency={state['tool_latency_ms']}/{state['tool_latency_cap_ms']}ms)"
+                )
+                steps = state["reasoning_steps"] + [budget_msg]
+                if not has_evidence:
+                    steps.append("ANSWER: I couldn't complete this request because the tool budget has been exhausted.")
+                return {
+                    "step_count": step_count,
+                    "next": "ANSWER" if has_evidence else "STOP",
+                    "plan": [],  # Invalidate plan
+                    "reasoning_steps": steps,
+                }
 
     # =========================================================================
     # PLAN EXECUTION: Take the next planned step
@@ -698,46 +789,6 @@ Rules:
     # Clean up stale repaired tool request if there's no error
     if not state.get("last_error") and state.get("repaired_tool_request"):
         return {"repaired_tool_request": None}
-
-    # =========================================================================
-    # TOOL FAILURE RECOVERY
-    # =========================================================================
-
-    # Guardrail: Too many consecutive tool failures
-    if state["tool_fail_count"] >= state["tool_fail_cap"]:
-        has_evidence = bool(state["knowledge"]) or bool(state["tool_results"])
-        if has_evidence:
-            # We have some evidence - try to answer with what we have
-            return {
-                "step_count": step_count,
-                "next": "ANSWER",
-                "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → ANSWER (best-effort)"],
-            }
-        # No evidence at all - give up
-        return {
-            "step_count": step_count,
-            "next": "STOP",
-            "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: tool_fail_cap reached"],
-        }
-
-    # Recovery: If a tool failed, try the repaired version or go to THINK for repair
-    if state["tool_fail_count"] > 0:
-        repaired = state.get("repaired_tool_request")
-        if repaired:
-            # We have a repaired tool request from THINK - try it
-            return {
-                "step_count": step_count,
-                "next": "TOOL",
-                "tool_request": repaired,
-                "repaired_tool_request": None,
-                "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → TOOL (repaired)"],
-            }
-        # No repair yet - go to THINK to generate one
-        return {
-            "step_count": step_count,
-            "next": "THINK",
-            "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → THINK (tool failed)"],
-        }
 
     # =========================================================================
     # SUCCESS CHECK: If we have a successful tool result, go to ANSWER
