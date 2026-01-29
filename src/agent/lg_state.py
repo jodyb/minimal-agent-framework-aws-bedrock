@@ -84,3 +84,12 @@ class LGState(TypedDict):
     tool_call_cap: int        # Max tool calls allowed (prevents runaway execution)
     tool_latency_ms: int      # Cumulative latency of all tool executions (ms) - estimated at this time
     tool_latency_cap_ms: int  # Max total latency budget (stops slow tool chains)
+
+    # -------------------------------------------------------------------------
+    # OBSERVABILITY: control-plane decision events
+    # -------------------------------------------------------------------------
+    # Record why the agent made key decisions for auditing/debugging
+    # Focus on high-level decisions: tool selection, retrievals, stopping, etc.
+    # Sample event {"type": "decision", "step": 7, "action": "TOOL","reason": "calculator selected (low cost, low risk)"}
+    events: List[Dict[str, Any]]  
+    

@@ -7,6 +7,31 @@ def _short(s: str, n: int = 140) -> str:
     return s if len(s) <= n else s[: n - 3] + "..."
 
 def pretty_print_run(final_state: Dict[str, Any]) -> None:
+    # Extract and display the answer prominently at the top
+    print("\n=== ANSWER ===")
+    answer = None
+
+    # Look for answer in reasoning_steps (format: "ANSWER: ...")
+    steps: List[str] = final_state.get("reasoning_steps", [])
+    for step in reversed(steps):
+        if "ANSWER:" in step:
+            # Extract just the answer part
+            answer = step.split("ANSWER:", 1)[1].strip()
+            break
+
+    if answer:
+        print(answer)
+    else:
+        # No explicit answer - show termination reason
+        next_state = final_state.get("next", "unknown")
+        last_error = final_state.get("last_error")
+        if next_state == "STOP" and last_error:
+            print(f"[No answer - stopped due to error: {last_error}]")
+        elif next_state == "STOP":
+            print("[No answer - agent stopped]")
+        else:
+            print(f"[No answer - final state: {next_state}]")
+
     print("\n=== FINAL STATE ===")
     print(f"next: {final_state.get('next')}")
     print(f"step_count: {final_state.get('step_count')}")
@@ -24,7 +49,12 @@ def pretty_print_run(final_state: Dict[str, Any]) -> None:
     print(f"calls: {tool_calls}/{tool_call_cap}")
     print(f"latency: {tool_latency}ms used, {latency_remaining}ms remaining (cap: {tool_latency_cap}ms)")
 
-    print("\n=== REASONING STEPS (last 12) ===")
-    steps: List[str] = final_state.get("reasoning_steps", [])
-    for s in steps[-12:]:
-        print("-", _short(str(s), 180))
+    print("\n=== EVENTS ===")
+    events: List[Dict[str, Any]] = final_state.get("events", [])
+    for evt in events:
+        evt_type = evt.get("type", "unknown")
+        step = evt.get("step", "?")
+        # Build a summary string from the remaining keys
+        details = {k: v for k, v in evt.items() if k not in ("type", "step")}
+        detail_str = ", ".join(f"{k}={_short(str(v), 40)}" for k, v in details.items())
+        print(f"  [{step}] {evt_type}: {detail_str}")
