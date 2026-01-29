@@ -58,3 +58,11 @@ def pretty_print_run(final_state: Dict[str, Any]) -> None:
         details = {k: v for k, v in evt.items() if k not in ("type", "step")}
         detail_str = ", ".join(f"{k}={_short(str(v), 40)}" for k, v in details.items())
         print(f"  [{step}] {evt_type}: {detail_str}")
+
+    print("\n=== DECISION RATIONALE ===")
+    rationales: List[str] = final_state.get("decision_rationale", [])
+    if rationales:
+        for i, rationale in enumerate(rationales, 1):
+            print(f"  [{i}] {rationale}")
+    else:
+        print("  (none recorded)")

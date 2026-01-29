@@ -92,4 +92,12 @@ class LGState(TypedDict):
     # Focus on high-level decisions: tool selection, retrievals, stopping, etc.
     # Sample event {"type": "decision", "step": 7, "action": "TOOL","reason": "calculator selected (low cost, low risk)"}
     events: List[Dict[str, Any]]  
+
+    # -------------------------------------------------------------------------
+    # DECISION RATIONALE: why a choice was made (append only)
+    # -------------------------------------------------------------------------
+    # Example: Chose TOOL over RETRIEVE because cost=low, latency=fast, and computation was required.
+    # Example: Skipped TOOL because latency budget was insufficient; answering best-effort.
+    decision_rationale: List[str]
+
     

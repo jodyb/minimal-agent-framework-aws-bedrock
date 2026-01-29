@@ -146,6 +146,18 @@ import agent.tools  # noqa: F401 (ensures tools are registered at import time)
 llm = get_llm()
 
 # =============================================================================
+# RECORD EVENT
+# =============================================================================
+def _event(state: LGState, **e: Any) -> list[dict[str, Any]]:
+    """Append a structured event to state['events']."""
+    return (state.get("events") or []) + [e]
+
+
+def _rationale(state: LGState, reason: str) -> list[str]:
+    """Append a decision rationale to state['decision_rationale']."""
+    return (state.get("decision_rationale") or []) + [reason]
+
+# =============================================================================
 # MEMORY NODE
 # =============================================================================
 def memory_node(state: LGState) -> Dict[str, Any]:
@@ -250,14 +262,6 @@ Return ONLY valid JSON:
         "think_count": state["think_count"] + 1,
         "reasoning_steps": state["reasoning_steps"] + [notes],
     }
-
-
-# =============================================================================
-# RETRIEVE NODE
-# =============================================================================
-def _event(state: LGState, **e: Any) -> list[dict[str, Any]]:
-    """Append a structured event to state['events']."""
-    return (state.get("events") or []) + [e]
 
 # =============================================================================
 # RETRIEVE NODE
@@ -589,6 +593,11 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                     tool_latency_ms=state["tool_latency_ms"],
                     tool_latency_cap_ms=state["tool_latency_cap_ms"],
                 ),
+                "decision_rationale": _rationale(
+                    state,
+                    f"Skipped calculator: tool budget exhausted (calls={state['tool_calls']}/{state['tool_call_cap']}, "
+                    f"latency={state['tool_latency_ms']}/{state['tool_latency_cap_ms']}ms). No alternatives available; stopping."
+                ),
             }
         return {
             "step_count": step_count,
@@ -596,6 +605,10 @@ def reason_node(state: LGState) -> Dict[str, Any]:
             "tool_request": {"tool": "calculator", "args": {"expression": math_expr}},
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → TOOL (calculator)"],
             "events": _event(state, type="tool_request", step=step_count, tool="calculator", expression=math_expr),
+            "decision_rationale": _rationale(
+                state,
+                f"Fast-path: detected math expression '{math_expr}'; bypassing planning and routing directly to calculator (cost=low, latency=50ms)."
+            ),
         }
 
     # =========================================================================
@@ -621,6 +634,11 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                     tool_fail_cap=state["tool_fail_cap"],
                     outcome="answer",
                 ),
+                "decision_rationale": _rationale(
+                    state,
+                    f"Tool fail cap reached ({state['tool_fail_count']}/{state['tool_fail_cap']}). "
+                    "Chose ANSWER over STOP because knowledge/tool_results available as fallback evidence."
+                ),
             }
         return {
             "step_count": step_count,
@@ -634,6 +652,11 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                 tool_fail_count=state["tool_fail_count"],
                 tool_fail_cap=state["tool_fail_cap"],
                 outcome="stop",
+            ),
+            "decision_rationale": _rationale(
+                state,
+                f"Tool fail cap reached ({state['tool_fail_count']}/{state['tool_fail_cap']}). "
+                "Chose STOP over ANSWER because no fallback evidence available."
             ),
         }
 
@@ -649,6 +672,10 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                 "repaired_tool_request": None,
                 "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → TOOL (repaired)"],
                 "events": _event(state, type="tool_request", step=step_count, tool=repaired.get("tool"), args=repaired.get("args"), repair=True),
+                "decision_rationale": _rationale(
+                    state,
+                    f"Tool failed (error: {state.get('last_error')}). Using repaired request from THINK node rather than re-planning."
+                ),
             }
         # No repair yet - go to THINK to generate one
         return {
@@ -656,6 +683,11 @@ def reason_node(state: LGState) -> Dict[str, Any]:
             "next": "THINK",
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → THINK (tool failed, attempting repair)"],
             "events": _event(state, type="routing", step=step_count, reason="tool_repair", next="THINK", last_error=state.get("last_error")),
+            "decision_rationale": _rationale(
+                state,
+                f"Tool failed (error: {state.get('last_error')}). Routing to THINK for repair proposal "
+                f"(attempt {state['tool_fail_count']}/{state['tool_fail_cap']})."
+            ),
         }
 
     # =========================================================================
@@ -708,6 +740,13 @@ Return ONLY valid JSON in this shape:
                 "plan": plan,
                 "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] PLAN created: {plan}"],
                 "events": _event(state, type="plan_created", step=step_count, plan=plan),
+                "decision_rationale": _rationale(
+                    state,
+                    f"Created plan {plan} (have_knowledge={bool(state['knowledge'])}, "
+                    f"have_tool_results={bool(state['tool_results'])}). "
+                    f"Plan addresses question by {'retrieving context first' if 'RETRIEVE' in plan else 'reasoning'} "
+                    f"then {'answering' if 'ANSWER' in plan else 'continuing'}."
+                ),
             }
 
     # =========================================================================
@@ -724,6 +763,11 @@ Return ONLY valid JSON in this shape:
                 "reasoning_steps": state["reasoning_steps"]
                 + [f"[step {step_count}] PLAN invalidated: retrieve_cap reached"],
                 "events": _event(state, type="plan_invalidated", step=step_count, reason="retrieve_cap", plan=state["plan"]),
+                "decision_rationale": _rationale(
+                    state,
+                    f"Plan invalidated: next step was RETRIEVE but retrieve_cap reached "
+                    f"({state['retrieve_count']}/{state['retrieve_cap']}). Re-planning required."
+                ),
             }
 
         # If next plan step is TOOL but we're in a tool-failure recovery mode, drop plan.
@@ -735,6 +779,11 @@ Return ONLY valid JSON in this shape:
                 "reasoning_steps": state["reasoning_steps"]
                 + [f"[step {step_count}] PLAN invalidated: tool failure recovery active"],
                 "events": _event(state, type="plan_invalidated", step=step_count, reason="tool_failure_active", plan=state["plan"]),
+                "decision_rationale": _rationale(
+                    state,
+                    f"Plan invalidated: next step was TOOL but tool failure recovery active "
+                    f"(fail_count={state['tool_fail_count']}). Must resolve failure before continuing plan."
+                ),
             }
 
         # If next plan step is TOOL but tool budget is exhausted, drop plan.
@@ -753,9 +802,10 @@ Return ONLY valid JSON in this shape:
                 steps = state["reasoning_steps"] + [budget_msg]
                 if not has_evidence:
                     steps.append("ANSWER: I couldn't complete this request because the tool budget has been exhausted.")
+                outcome = "ANSWER" if has_evidence else "STOP"
                 return {
                     "step_count": step_count,
-                    "next": "ANSWER" if has_evidence else "STOP",
+                    "next": outcome,
                     "plan": [],  # Invalidate plan
                     "reasoning_steps": steps,
                     "events": _event(
@@ -768,6 +818,13 @@ Return ONLY valid JSON in this shape:
                         tool_latency_ms=state["tool_latency_ms"],
                         tool_latency_cap_ms=state["tool_latency_cap_ms"],
                         outcome="answer" if has_evidence else "stop",
+                    ),
+                    "decision_rationale": _rationale(
+                        state,
+                        f"Plan invalidated: next step was TOOL but budget exhausted "
+                        f"(calls={state['tool_calls']}/{state['tool_call_cap']}, "
+                        f"latency={state['tool_latency_ms']}/{state['tool_latency_cap_ms']}ms). "
+                        f"Chose {outcome} {'because fallback evidence exists' if has_evidence else 'because no fallback evidence'}."
                     ),
                 }
 
@@ -785,6 +842,7 @@ Return ONLY valid JSON in this shape:
             # Special case: math expression → use calculator directly
             plan_math_expr = _extract_math_expression(state["question"])
             if plan_math_expr:
+                max_allowed_risk = state.get("max_tool_risk", "medium")
                 return {
                     "step_count": step_count,
                     "next": "TOOL",
@@ -793,6 +851,11 @@ Return ONLY valid JSON in this shape:
                     "reasoning_steps": state["reasoning_steps"]
                     + [f"[step {step_count}] PLAN step → TOOL (calculator) (remaining={remaining})"],
                     "events": _event(state, type="plan_step", step=step_count, plan_step="TOOL", tool="calculator", remaining=remaining),
+                    "decision_rationale": _rationale(
+                        state,
+                        f"Selected calculator for math expression '{plan_math_expr}' (cost=low, risk=low, latency=50ms). "
+                        f"Alternatives filtered by risk policy (max_risk={max_allowed_risk})."
+                    ),
                 }
 
             # Get all registered tools
@@ -862,6 +925,10 @@ Rules:
                     "reasoning_steps": state["reasoning_steps"]
                     + [f"[step {step_count}] PLAN step TOOL failed → THINK (remaining={remaining})"],
                     "events": _event(state, type="plan_step", step=step_count, plan_step="TOOL", fallback="THINK", remaining=remaining),
+                    "decision_rationale": _rationale(
+                        state,
+                        "Tool selection failed (LLM returned invalid tool). Chose THINK over STOP to allow reasoning and retry."
+                    ),
                 }
 
             return {
@@ -872,11 +939,21 @@ Rules:
                 "reasoning_steps": state["reasoning_steps"]
                 + [f"[step {step_count}] PLAN step → TOOL ({tool_name}) (remaining={remaining})"],
                 "events": _event(state, type="plan_step", step=step_count, plan_step="TOOL", tool=tool_name, args=args, remaining=remaining),
+                "decision_rationale": _rationale(
+                    state,
+                    f"Selected tool '{tool_name}' from {len(tools_catalog)} policy-filtered candidates "
+                    f"(max_risk={max_allowed_risk}). Candidates sorted by cost→latency→name; '{tool_name}' chosen by LLM."
+                ),
             }
 
         # -----------------------------------------------------------------
         # Non-TOOL steps (THINK, RETRIEVE, ANSWER) just transition directly
         # -----------------------------------------------------------------
+        step_reasons = {
+            "THINK": "expanding reasoning context",
+            "RETRIEVE": f"fetching knowledge (retrieve_count={state['retrieve_count']}/{state['retrieve_cap']})",
+            "ANSWER": "sufficient evidence gathered to formulate response",
+        }
         return {
             "step_count": step_count,
             "next": next_step,
@@ -884,6 +961,11 @@ Rules:
             "reasoning_steps": state["reasoning_steps"]
             + [f"[step {step_count}] PLAN step → {next_step} (remaining={remaining})"],
             "events": _event(state, type="plan_step", step=step_count, plan_step=next_step, remaining=remaining),
+            "decision_rationale": _rationale(
+                state,
+                f"Executing plan step {next_step}: {step_reasons.get(next_step, 'following plan')}. "
+                f"Remaining steps: {remaining if remaining else 'none'}."
+            ),
         }
 
     # =========================================================================
@@ -897,6 +979,10 @@ Rules:
             "next": "STOP",
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: max_steps reached"],
             "events": _event(state, type="guardrail", step=step_count, guardrail="max_steps", max_steps=state["max_steps"]),
+            "decision_rationale": _rationale(
+                state,
+                f"Guardrail triggered: max_steps reached ({step_count}/{state['max_steps']}). Forced STOP to prevent infinite loop."
+            ),
         }
 
     # Guardrail: Retrieval cap reached but no knowledge found
@@ -906,6 +992,11 @@ Rules:
             "next": "STOP",
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: retrieve_cap reached without evidence"],
             "events": _event(state, type="guardrail", step=step_count, guardrail="retrieve_cap", retrieve_count=state["retrieve_count"], retrieve_cap=state["retrieve_cap"]),
+            "decision_rationale": _rationale(
+                state,
+                f"Guardrail triggered: retrieve_cap reached ({state['retrieve_count']}/{state['retrieve_cap']}) "
+                "with no knowledge found. Chose STOP over ANSWER because no evidence to answer from."
+            ),
         }
 
     # Clean up stale repaired tool request if there's no error
@@ -980,15 +1071,29 @@ Return ONLY valid JSON in exactly this shape:
             "next": fallback_next,
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON fallback"],
             "events": _event(state, type="routing", step=step_count, reason="llm_fallback", next=fallback_next),
+            "decision_rationale": _rationale(
+                state,
+                f"LLM routing failed (invalid JSON). Chose {fallback_next} as safe default "
+                f"(knowledge={bool(state['knowledge'])}, retrieve_count={state['retrieve_count']}/{state['retrieve_cap']})."
+            ),
         }
 
     # Execute the LLM's decision
     nxt = decision.get("next", "STOP")
+    tool_info = ""
+    if nxt == "TOOL":
+        tool_info = f" Tool: {decision.get('tool', 'unknown')}."
+
     update: Dict[str, Any] = {
         "step_count": step_count,
         "next": nxt,
         "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → {nxt}"],
         "events": _event(state, type="routing", step=step_count, reason="llm_decision", next=nxt, decision=decision),
+        "decision_rationale": _rationale(
+            state,
+            f"LLM routing: chose {nxt} (have_knowledge={bool(state['knowledge'])}, "
+            f"have_tool_results={bool(state['tool_results'])}, tools_available={len(tools_catalog)}).{tool_info}"
+        ),
     }
 
     # If routing to TOOL, also set up the tool request
