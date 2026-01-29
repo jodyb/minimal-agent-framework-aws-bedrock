@@ -88,9 +88,55 @@ ANSWER (answer_node):
 """
 
 import json
-from typing import Any, Dict, List
+import re
+from typing import Any, Dict, List, Optional
 
 from agent.lg_state import LGState
+
+
+def _extract_math_expression(question: str) -> Optional[str]:
+    """
+    Detect if a question is asking for a math calculation and extract the expression.
+
+    Handles:
+      - Pure expressions: "2+2", "10 / 5", "(3 + 4) * 2"
+      - Natural language: "What is 2 plus 2?", "calculate 10 times 5"
+
+    Returns the math expression if detected, None otherwise.
+    """
+    q = question.strip()
+
+    # Check for pure math expression (digits and operators only)
+    if q and all((c.isdigit() or c in " +-*/().") for c in q) and any(c.isdigit() for c in q):
+        return q
+
+    # Convert natural language math words to operators
+    text = q.lower()
+    # Remove common question prefixes
+    text = re.sub(r"^(what is|what's|calculate|compute|evaluate|solve|find)\s+", "", text)
+    # Remove trailing punctuation
+    text = re.sub(r"[?!.]+$", "", text).strip()
+
+    # Replace word operators with symbols
+    replacements = [
+        (r"\bplus\b", "+"),
+        (r"\bminus\b", "-"),
+        (r"\btimes\b", "*"),
+        (r"\bmultiplied by\b", "*"),
+        (r"\bdivided by\b", "/"),
+        (r"\bover\b", "/"),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+
+    # Clean up whitespace
+    text = " ".join(text.split())
+
+    # Now check if the result is a valid math expression
+    if text and all((c.isdigit() or c in " +-*/().") for c in text) and any(c.isdigit() for c in text):
+        return text
+
+    return None
 from agent.llm import get_llm
 from agent.retrieve import retrieve
 from agent.tool_registry import get_tool, list_tools
@@ -204,6 +250,14 @@ Return ONLY valid JSON:
         "think_count": state["think_count"] + 1,
         "reasoning_steps": state["reasoning_steps"] + [notes],
     }
+
+
+# =============================================================================
+# RETRIEVE NODE
+# =============================================================================
+def _event(state: LGState, **e: Any) -> list[dict[str, Any]]:
+    """Append a structured event to state['events']."""
+    return (state.get("events") or []) + [e]
 
 # =============================================================================
 # RETRIEVE NODE
@@ -349,13 +403,27 @@ def tool_node(state: LGState) -> Dict[str, Any]:
 
     # Track tool budget consumption
     updates["tool_calls"] = state["tool_calls"] + 1
+    latency_ms = 0
     # Only add latency if we found a valid tool with a spec
     if tool_name and not failed:
         try:
             spec = get_tool(tool_name)
-            updates["tool_latency_ms"] = state["tool_latency_ms"] + spec.get("latency_ms", 0)
+            latency_ms = spec.get("latency_ms", 0)
+            updates["tool_latency_ms"] = state["tool_latency_ms"] + latency_ms
         except Exception:
             pass  # Tool not found, skip latency tracking
+
+    # Record tool execution event
+    updates["events"] = _event(
+        state,
+        type="tool_executed",
+        tool=tool_name or "(none)",
+        args=args,
+        ok=result.get("ok", False),
+        output=result.get("output"),
+        error=last_error,
+        latency_ms=latency_ms,
+    )
 
     return updates
 
@@ -468,12 +536,13 @@ def reason_node(state: LGState) -> Dict[str, Any]:
     step_count = state["step_count"] + 1
 
     # =========================================================================
-    # FAST-PATH: Pure math expression → calculator directly (skip planning)
+    # FAST-PATH: Math expression → calculator directly (skip planning)
     # =========================================================================
     # Detect expressions like "2+2", "10 / 5", "(3 + 4) * 2"
+    # Also handles natural language: "What is 2 plus 2?"
     # This avoids the overhead of planning for trivial calculations
-    q = state["question"].strip()
-    if q and all((c.isdigit() or c in " +-*/().") for c in q) and any(c.isdigit() for c in q):
+    math_expr = _extract_math_expression(state["question"])
+    if math_expr:
         # If we already have a calculator result, check outcome
         if state["tool_results"]:
             last = state["tool_results"][-1]
@@ -484,6 +553,7 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                         "step_count": step_count,
                         "next": "ANSWER",
                         "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → ANSWER (calculator done)"],
+                        "events": _event(state, type="routing", step=step_count, reason="calculator_done", next="ANSWER"),
                     }
                 else:
                     # Calculator failed (e.g., division by zero) - stop
@@ -491,6 +561,7 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                         "step_count": step_count,
                         "next": "STOP",
                         "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: calculator error"],
+                        "events": _event(state, type="guardrail", step=step_count, guardrail="calculator_error", error=last.get("output", {}).get("error")),
                     }
 
         # No result yet - check budget then call calculator
@@ -508,12 +579,23 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                     f"latency={state['tool_latency_ms']}/{state['tool_latency_cap_ms']}ms)",
                     "ANSWER: I couldn't complete this request because the tool budget has been exhausted.",
                 ],
+                "events": _event(
+                    state,
+                    type="guardrail",
+                    step=step_count,
+                    guardrail="tool_budget_exhausted",
+                    tool_calls=state["tool_calls"],
+                    tool_call_cap=state["tool_call_cap"],
+                    tool_latency_ms=state["tool_latency_ms"],
+                    tool_latency_cap_ms=state["tool_latency_cap_ms"],
+                ),
             }
         return {
             "step_count": step_count,
             "next": "TOOL",
-            "tool_request": {"tool": "calculator", "args": {"expression": q}},
+            "tool_request": {"tool": "calculator", "args": {"expression": math_expr}},
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → TOOL (calculator)"],
+            "events": _event(state, type="tool_request", step=step_count, tool="calculator", expression=math_expr),
         }
 
     # =========================================================================
@@ -530,11 +612,29 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                 "step_count": step_count,
                 "next": "ANSWER",
                 "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → ANSWER (best-effort after tool failures)"],
+                "events": _event(
+                    state,
+                    type="guardrail",
+                    step=step_count,
+                    guardrail="tool_fail_cap",
+                    tool_fail_count=state["tool_fail_count"],
+                    tool_fail_cap=state["tool_fail_cap"],
+                    outcome="answer",
+                ),
             }
         return {
             "step_count": step_count,
             "next": "STOP",
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: tool_fail_cap reached"],
+            "events": _event(
+                state,
+                type="guardrail",
+                step=step_count,
+                guardrail="tool_fail_cap",
+                tool_fail_count=state["tool_fail_count"],
+                tool_fail_cap=state["tool_fail_cap"],
+                outcome="stop",
+            ),
         }
 
     # Recovery: If a tool failed, try the repaired version or go to THINK for repair
@@ -548,12 +648,14 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                 "tool_request": repaired,
                 "repaired_tool_request": None,
                 "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → TOOL (repaired)"],
+                "events": _event(state, type="tool_request", step=step_count, tool=repaired.get("tool"), args=repaired.get("args"), repair=True),
             }
         # No repair yet - go to THINK to generate one
         return {
             "step_count": step_count,
             "next": "THINK",
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → THINK (tool failed, attempting repair)"],
+            "events": _event(state, type="routing", step=step_count, reason="tool_repair", next="THINK", last_error=state.get("last_error")),
         }
 
     # =========================================================================
@@ -605,6 +707,7 @@ Return ONLY valid JSON in this shape:
                 "step_count": step_count,
                 "plan": plan,
                 "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] PLAN created: {plan}"],
+                "events": _event(state, type="plan_created", step=step_count, plan=plan),
             }
 
     # =========================================================================
@@ -620,6 +723,7 @@ Return ONLY valid JSON in this shape:
                 "plan": [],
                 "reasoning_steps": state["reasoning_steps"]
                 + [f"[step {step_count}] PLAN invalidated: retrieve_cap reached"],
+                "events": _event(state, type="plan_invalidated", step=step_count, reason="retrieve_cap", plan=state["plan"]),
             }
 
         # If next plan step is TOOL but we're in a tool-failure recovery mode, drop plan.
@@ -630,6 +734,7 @@ Return ONLY valid JSON in this shape:
                 "plan": [],
                 "reasoning_steps": state["reasoning_steps"]
                 + [f"[step {step_count}] PLAN invalidated: tool failure recovery active"],
+                "events": _event(state, type="plan_invalidated", step=step_count, reason="tool_failure_active", plan=state["plan"]),
             }
 
         # If next plan step is TOOL but tool budget is exhausted, drop plan.
@@ -653,6 +758,17 @@ Return ONLY valid JSON in this shape:
                     "next": "ANSWER" if has_evidence else "STOP",
                     "plan": [],  # Invalidate plan
                     "reasoning_steps": steps,
+                    "events": _event(
+                        state,
+                        type="guardrail",
+                        step=step_count,
+                        guardrail="tool_budget_exhausted",
+                        tool_calls=state["tool_calls"],
+                        tool_call_cap=state["tool_call_cap"],
+                        tool_latency_ms=state["tool_latency_ms"],
+                        tool_latency_cap_ms=state["tool_latency_cap_ms"],
+                        outcome="answer" if has_evidence else "stop",
+                    ),
                 }
 
     # =========================================================================
@@ -666,16 +782,17 @@ Return ONLY valid JSON in this shape:
         # TOOL step requires additional work: select which tool and args
         # -----------------------------------------------------------------
         if next_step == "TOOL":
-            # Special case: pure math expression → use calculator directly
-            q = state["question"].strip()
-            if q and all((c.isdigit() or c in " +-*/().") for c in q) and any(c.isdigit() for c in q):
+            # Special case: math expression → use calculator directly
+            plan_math_expr = _extract_math_expression(state["question"])
+            if plan_math_expr:
                 return {
                     "step_count": step_count,
                     "next": "TOOL",
                     "plan": remaining,
-                    "tool_request": {"tool": "calculator", "args": {"expression": q}},
+                    "tool_request": {"tool": "calculator", "args": {"expression": plan_math_expr}},
                     "reasoning_steps": state["reasoning_steps"]
                     + [f"[step {step_count}] PLAN step → TOOL (calculator) (remaining={remaining})"],
+                    "events": _event(state, type="plan_step", step=step_count, plan_step="TOOL", tool="calculator", remaining=remaining),
                 }
 
             # Get all registered tools
@@ -744,6 +861,7 @@ Rules:
                     "plan": remaining,
                     "reasoning_steps": state["reasoning_steps"]
                     + [f"[step {step_count}] PLAN step TOOL failed → THINK (remaining={remaining})"],
+                    "events": _event(state, type="plan_step", step=step_count, plan_step="TOOL", fallback="THINK", remaining=remaining),
                 }
 
             return {
@@ -753,6 +871,7 @@ Rules:
                 "tool_request": {"tool": tool_name, "args": args},
                 "reasoning_steps": state["reasoning_steps"]
                 + [f"[step {step_count}] PLAN step → TOOL ({tool_name}) (remaining={remaining})"],
+                "events": _event(state, type="plan_step", step=step_count, plan_step="TOOL", tool=tool_name, args=args, remaining=remaining),
             }
 
         # -----------------------------------------------------------------
@@ -764,6 +883,7 @@ Rules:
             "plan": remaining,
             "reasoning_steps": state["reasoning_steps"]
             + [f"[step {step_count}] PLAN step → {next_step} (remaining={remaining})"],
+            "events": _event(state, type="plan_step", step=step_count, plan_step=next_step, remaining=remaining),
         }
 
     # =========================================================================
@@ -776,6 +896,7 @@ Rules:
             "step_count": step_count,
             "next": "STOP",
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: max_steps reached"],
+            "events": _event(state, type="guardrail", step=step_count, guardrail="max_steps", max_steps=state["max_steps"]),
         }
 
     # Guardrail: Retrieval cap reached but no knowledge found
@@ -784,6 +905,7 @@ Rules:
             "step_count": step_count,
             "next": "STOP",
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: retrieve_cap reached without evidence"],
+            "events": _event(state, type="guardrail", step=step_count, guardrail="retrieve_cap", retrieve_count=state["retrieve_count"], retrieve_cap=state["retrieve_cap"]),
         }
 
     # Clean up stale repaired tool request if there's no error
@@ -800,18 +922,20 @@ Rules:
                 "step_count": step_count,
                 "next": "ANSWER",
                 "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → ANSWER (tool succeeded)"],
+                "events": _event(state, type="routing", step=step_count, reason="tool_succeeded", next="ANSWER", tool=last_result.get("tool")),
             }
 
     # =========================================================================
     # MATH EXPRESSION CHECK (fallback - may be reached if planning failed)
     # =========================================================================
-    q = state["question"].strip()
-    if q and all((c.isdigit() or c in " +-*/().") for c in q) and any(c.isdigit() for c in q):
+    fallback_math_expr = _extract_math_expression(state["question"])
+    if fallback_math_expr:
         return {
             "step_count": step_count,
             "next": "TOOL",
-            "tool_request": {"tool": "calculator", "args": {"expression": q}},
+            "tool_request": {"tool": "calculator", "args": {"expression": fallback_math_expr}},
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → TOOL (calculator)"],
+            "events": _event(state, type="tool_request", step=step_count, tool="calculator", expression=fallback_math_expr),
         }
 
     # =========================================================================
@@ -850,10 +974,12 @@ Return ONLY valid JSON in exactly this shape:
     except Exception:
         # JSON parse failed - use safe fallback
         # If we don't have knowledge and can still retrieve, try RETRIEVE; otherwise STOP
+        fallback_next = "RETRIEVE" if (not state["knowledge"] and state["retrieve_count"] < state["retrieve_cap"]) else "STOP"
         return {
             "step_count": step_count,
-            "next": "RETRIEVE" if (not state["knowledge"] and state["retrieve_count"] < state["retrieve_cap"]) else "STOP",
+            "next": fallback_next,
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON fallback"],
+            "events": _event(state, type="routing", step=step_count, reason="llm_fallback", next=fallback_next),
         }
 
     # Execute the LLM's decision
@@ -862,6 +988,7 @@ Return ONLY valid JSON in exactly this shape:
         "step_count": step_count,
         "next": nxt,
         "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → {nxt}"],
+        "events": _event(state, type="routing", step=step_count, reason="llm_decision", next=nxt, decision=decision),
     }
 
     # If routing to TOOL, also set up the tool request

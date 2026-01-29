@@ -9,7 +9,7 @@ from agent.lg_state import LGState
 
 def main() -> None:
     # The question/task for the agent to solve (modify this to test different inputs)
-    question = "2+2"  # change me
+    question = "What is 2 plus 2?"  # change me
 
     # Initialize the agent's state dictionary with all required fields
     state: LGState = {
@@ -58,7 +58,10 @@ def main() -> None:
         "max_tool_risk": "medium",      # Maximum risk level for tools (low/medium/high)
 
         # --- Planning ---
-        "plan": []                      # List of planned steps (if using planning mode)
+        "plan": [],                      # List of planned steps (if using planning mode)
+
+        # --- Observability: control-plane decision events ---
+        "events": []                    # Log of key decision events for auditing/debugging
     }
 
     # Build the LangGraph state machine (nodes + edges)
