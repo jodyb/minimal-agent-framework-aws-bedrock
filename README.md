@@ -8,9 +8,11 @@ A lightweight agent framework built with LangGraph. Demonstrates core agent patt
 - **LangGraph Integration** - Externalized control flow via graph-based orchestration
 - **REASON/THINK Separation** - Control plane (policy, transitions) vs cognitive artifacts (reasoning notes)
 - **Self-Describing Tools** - MCP-style registry with cost/risk/latency metadata
-- **Guardrails** - Step limits, retrieval caps, tool failure tracking
+- **Guardrails** - Step limits, retrieval caps, tool failure tracking, tool budget limits
 - **Policy-Driven Tool Selection** - Runtime control via `max_tool_risk` parameter
 - **Tool Repair** - Automatic retry with LLM-guided repair on failures
+- **Decision Rationale** - Human-readable explanations for why the agent made each decision
+- **Observability Events** - Structured event log for auditing and debugging
 
 ## Architecture
 
@@ -26,11 +28,18 @@ A lightweight agent framework built with LangGraph. Demonstrates core agent patt
 └─────────────┘                         └─────────────┘
 ```
 
-- **REASON** - Decides next action based on state, knowledge, and policy
+- **REASON** - Decides next action based on state, knowledge, and policy; records decision rationale
 - **THINK** - Generates reasoning notes; handles tool repair proposals
-- **TOOL** - Executes tools and validates outputs
+- **TOOL** - Executes tools and validates outputs; tracks budget consumption
 - **RETRIEVE** - Fetches knowledge (stub; extensible for RAG)
 - **ANSWER** - Produces final response
+
+### Observability
+
+The agent maintains two observability streams:
+
+- **`events`** - Structured log of what happened (tool calls, plan creation, guardrail triggers)
+- **`decision_rationale`** - Human-readable explanations of why each decision was made, including alternatives considered and constraints applied
 
 ## Project Structure
 
@@ -157,9 +166,50 @@ Key state parameters in `main.py`:
 |-----------|---------|-------------|
 | `max_steps` | 12 | Maximum reasoning steps |
 | `retrieve_cap` | 2 | Maximum retrieval attempts |
-| `tool_fail_cap` | 2 | Tool failures before giving up |
+| `tool_fail_cap` | 4 | Tool failures before giving up |
+| `tool_call_cap` | 5 | Maximum total tool calls allowed |
+| `tool_latency_cap_ms` | 10 | Maximum cumulative tool latency (ms) |
 | `max_tool_risk` | "medium" | Maximum allowed tool risk level |
 | `memory_every` | 4 | Steps between memory summarization |
+
+## Example Output
+
+Running `uv run python main.py` with a knowledge question:
+
+```
+=== ANSWER ===
+A practical agent is a goal-directed state machine where an LLM helps choose transitions and code enforces guardrails.
+
+=== FINAL STATE ===
+next: ANSWER
+step_count: 3
+retrieve_count: 1
+tool_fail_count: 0 last_error=None
+
+=== TOOL BUDGET ===
+calls: 0/5
+latency: 0ms used, 10ms remaining (cap: 10ms)
+
+=== EVENTS ===
+  [1] plan_created: plan=['RETRIEVE', 'ANSWER']
+  [2] plan_step: plan_step=RETRIEVE, remaining=['ANSWER']
+  [3] plan_step: plan_step=ANSWER, remaining=[]
+
+=== DECISION RATIONALE ===
+  [1] Created plan ['RETRIEVE', 'ANSWER'] (have_knowledge=False, have_tool_results=False). Plan addresses question by retrieving context first then answering.
+  [2] Executing plan step RETRIEVE: fetching knowledge (retrieve_count=0/2). Remaining steps: ['ANSWER'].
+  [3] Executing plan step ANSWER: sufficient evidence gathered to formulate response. Remaining steps: none.
+```
+
+Running with a math expression (`question = "2 + 2"`):
+
+```
+=== ANSWER ===
+The result is 4.0.
+
+=== DECISION RATIONALE ===
+  [1] Fast-path: detected math expression '2 + 2'; bypassing planning and routing directly to calculator (cost=low, latency=50ms).
+```
 
 ## License
 

@@ -61,7 +61,10 @@ def main() -> None:
         "plan": [],                      # List of planned steps (if using planning mode)
 
         # --- Observability: control-plane decision events ---
-        "events": []                    # Log of key decision events for auditing/debugging
+        "events": [],                    # Log of key decision events for auditing/debugging
+
+        # --- Decision rationale ---
+        "decision_rationale": []        # Justifications for key decisions made
     }
 
     # Build the LangGraph state machine (nodes + edges)
