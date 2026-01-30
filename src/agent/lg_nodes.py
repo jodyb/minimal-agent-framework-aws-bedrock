@@ -146,6 +146,20 @@ import agent.tools  # noqa: F401 (ensures tools are registered at import time)
 llm = get_llm()
 
 # =============================================================================
+# CONSTANTS
+# =============================================================================
+# Node names (used for routing decisions)
+NODE_THINK = "THINK"
+NODE_RETRIEVE = "RETRIEVE"
+NODE_TOOL = "TOOL"
+NODE_ANSWER = "ANSWER"
+NODE_STOP = "STOP"
+
+# Risk and cost ranking for tool policy filtering
+RISK_RANK = {"low": 0, "medium": 1, "high": 2}
+COST_RANK = {"low": 0, "medium": 1, "high": 2}
+
+# =============================================================================
 # RECORD EVENT
 # =============================================================================
 def _event(state: LGState, **e: Any) -> list[dict[str, Any]]:
@@ -156,6 +170,45 @@ def _event(state: LGState, **e: Any) -> list[dict[str, Any]]:
 def _rationale(state: LGState, reason: str) -> list[str]:
     """Append a decision rationale to state['decision_rationale']."""
     return (state.get("decision_rationale") or []) + [reason]
+
+
+def _is_tool_budget_exhausted(state: LGState) -> bool:
+    """Check if tool budget (calls or latency) has been exhausted."""
+    return (
+        state["tool_calls"] >= state["tool_call_cap"]
+        or state["tool_latency_ms"] >= state["tool_latency_cap_ms"]
+    )
+
+
+def _format_budget_status(state: LGState) -> str:
+    """Format tool budget status for logging/messages."""
+    return (
+        f"calls={state['tool_calls']}/{state['tool_call_cap']}, "
+        f"latency={state['tool_latency_ms']}/{state['tool_latency_cap_ms']}ms"
+    )
+
+
+def _get_policy_filtered_tools(state: LGState) -> List[Dict[str, Any]]:
+    """Get tools filtered and sorted by policy (risk limit, cost, latency)."""
+    tools_catalog = list_tools()
+    max_allowed_risk = state.get("max_tool_risk", "medium")
+
+    # Filter out tools that exceed the risk limit
+    filtered = [
+        t for t in tools_catalog
+        if RISK_RANK.get(t.get("risk", "high"), 2) <= RISK_RANK.get(max_allowed_risk, 1)
+    ]
+
+    # Sort by cost (prefer cheaper), then latency (prefer faster), then name
+    filtered.sort(
+        key=lambda t: (
+            COST_RANK.get(t.get("cost", "high"), 2),
+            int(t.get("latency_ms", 10_000)),
+            t.get("name", ""),
+        )
+    )
+    return filtered
+
 
 # =============================================================================
 # MEMORY NODE
@@ -456,7 +509,7 @@ def answer_node(state: LGState) -> Dict[str, Any]:
     The answer is appended to reasoning_steps for traceability.
 
     Returns:
-        State updates: reasoning_steps (with answer), next (set to "ANSWER")
+        State updates: reasoning_steps (with answer)
     """
     # -------------------------------------------------------------------------
     # Priority 1: Use tool results if available
@@ -467,7 +520,6 @@ def answer_node(state: LGState) -> Dict[str, Any]:
         if last.get("tool") == "calculator" and last.get("ok"):
             return {
                 "reasoning_steps": state["reasoning_steps"] + [f"ANSWER: The result is {last['output']['result']}."],
-                "next": "ANSWER",
             }
 
     # -------------------------------------------------------------------------
@@ -477,7 +529,6 @@ def answer_node(state: LGState) -> Dict[str, Any]:
         # Use the most recently retrieved document
         return {
             "reasoning_steps": state["reasoning_steps"] + [f"ANSWER: {state['knowledge'][-1]['text']}"],
-            "next": "ANSWER",
         }
 
     # -------------------------------------------------------------------------
@@ -485,7 +536,6 @@ def answer_node(state: LGState) -> Dict[str, Any]:
     # -------------------------------------------------------------------------
     return {
         "reasoning_steps": state["reasoning_steps"] + ["ANSWER: I don't have enough evidence to answer confidently."],
-        "next": "ANSWER",
     }
 
 # =============================================================================
@@ -555,32 +605,27 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                     # Calculator succeeded - go to ANSWER
                     return {
                         "step_count": step_count,
-                        "next": "ANSWER",
+                        "next": NODE_ANSWER,
                         "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → ANSWER (calculator done)"],
-                        "events": _event(state, type="routing", step=step_count, reason="calculator_done", next="ANSWER"),
+                        "events": _event(state, type="routing", step=step_count, reason="calculator_done", next=NODE_ANSWER),
                     }
                 else:
                     # Calculator failed (e.g., division by zero) - stop
                     return {
                         "step_count": step_count,
-                        "next": "STOP",
+                        "next": NODE_STOP,
                         "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: calculator error"],
                         "events": _event(state, type="guardrail", step=step_count, guardrail="calculator_error", error=last.get("output", {}).get("error")),
                     }
 
         # No result yet - check budget then call calculator
-        tool_budget_exhausted = (
-            state["tool_calls"] >= state["tool_call_cap"] or
-            state["tool_latency_ms"] >= state["tool_latency_cap_ms"]
-        )
-        if tool_budget_exhausted:
+        if _is_tool_budget_exhausted(state):
+            budget_status = _format_budget_status(state)
             return {
                 "step_count": step_count,
-                "next": "STOP",
+                "next": NODE_STOP,
                 "reasoning_steps": state["reasoning_steps"] + [
-                    f"[step {step_count}] STOP: tool budget exhausted "
-                    f"(calls={state['tool_calls']}/{state['tool_call_cap']}, "
-                    f"latency={state['tool_latency_ms']}/{state['tool_latency_cap_ms']}ms)",
+                    f"[step {step_count}] STOP: tool budget exhausted ({budget_status})",
                     "ANSWER: I couldn't complete this request because the tool budget has been exhausted.",
                 ],
                 "events": _event(
@@ -595,13 +640,12 @@ def reason_node(state: LGState) -> Dict[str, Any]:
                 ),
                 "decision_rationale": _rationale(
                     state,
-                    f"Skipped calculator: tool budget exhausted (calls={state['tool_calls']}/{state['tool_call_cap']}, "
-                    f"latency={state['tool_latency_ms']}/{state['tool_latency_cap_ms']}ms). No alternatives available; stopping."
+                    f"Skipped calculator: tool budget exhausted ({budget_status}). No alternatives available; stopping."
                 ),
             }
         return {
             "step_count": step_count,
-            "next": "TOOL",
+            "next": NODE_TOOL,
             "tool_request": {"tool": "calculator", "args": {"expression": math_expr}},
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → TOOL (calculator)"],
             "events": _event(state, type="tool_request", step=step_count, tool="calculator", expression=math_expr),
@@ -623,7 +667,7 @@ def reason_node(state: LGState) -> Dict[str, Any]:
         if has_evidence:
             return {
                 "step_count": step_count,
-                "next": "ANSWER",
+                "next": NODE_ANSWER,
                 "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → ANSWER (best-effort after tool failures)"],
                 "events": _event(
                     state,
@@ -642,7 +686,7 @@ def reason_node(state: LGState) -> Dict[str, Any]:
             }
         return {
             "step_count": step_count,
-            "next": "STOP",
+            "next": NODE_STOP,
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: tool_fail_cap reached"],
             "events": _event(
                 state,
@@ -667,7 +711,7 @@ def reason_node(state: LGState) -> Dict[str, Any]:
             # We have a repaired tool request from THINK - try it
             return {
                 "step_count": step_count,
-                "next": "TOOL",
+                "next": NODE_TOOL,
                 "tool_request": repaired,
                 "repaired_tool_request": None,
                 "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → TOOL (repaired)"],
@@ -680,9 +724,9 @@ def reason_node(state: LGState) -> Dict[str, Any]:
         # No repair yet - go to THINK to generate one
         return {
             "step_count": step_count,
-            "next": "THINK",
+            "next": NODE_THINK,
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → THINK (tool failed, attempting repair)"],
-            "events": _event(state, type="routing", step=step_count, reason="tool_repair", next="THINK", last_error=state.get("last_error")),
+            "events": _event(state, type="routing", step=step_count, reason="tool_repair", next=NODE_THINK, last_error=state.get("last_error")),
             "decision_rationale": _rationale(
                 state,
                 f"Tool failed (error: {state.get('last_error')}). Routing to THINK for repair proposal "
@@ -730,7 +774,7 @@ Return ONLY valid JSON in this shape:
             plan = []
 
         # Validate plan steps - only allow known node names
-        valid = {"THINK", "RETRIEVE", "TOOL", "ANSWER"}
+        valid = {NODE_THINK, NODE_RETRIEVE, NODE_TOOL, NODE_ANSWER}
         plan = [p for p in plan if p in valid][:3]  # Max 3 steps
 
         if plan:
@@ -744,8 +788,8 @@ Return ONLY valid JSON in this shape:
                     state,
                     f"Created plan {plan} (have_knowledge={bool(state['knowledge'])}, "
                     f"have_tool_results={bool(state['tool_results'])}). "
-                    f"Plan addresses question by {'retrieving context first' if 'RETRIEVE' in plan else 'reasoning'} "
-                    f"then {'answering' if 'ANSWER' in plan else 'continuing'}."
+                    f"Plan addresses question by {'retrieving context first' if NODE_RETRIEVE in plan else 'reasoning'} "
+                    f"then {'answering' if NODE_ANSWER in plan else 'continuing'}."
                 ),
             }
 
@@ -756,7 +800,7 @@ Return ONLY valid JSON in this shape:
     # drop the plan so the agent can re-plan with current information.
     if state["plan"]:
         # If next plan step is RETRIEVE but retrieval is no longer allowed, drop the plan.
-        if state["plan"][0] == "RETRIEVE" and state["retrieve_count"] >= state["retrieve_cap"]:
+        if state["plan"][0] == NODE_RETRIEVE and state["retrieve_count"] >= state["retrieve_cap"]:
             return {
                 "step_count": step_count,
                 "plan": [],
@@ -772,7 +816,7 @@ Return ONLY valid JSON in this shape:
 
         # If next plan step is TOOL but we're in a tool-failure recovery mode, drop plan.
         # We need to handle the failure first before continuing with the plan.
-        if state["plan"][0] == "TOOL" and state["tool_fail_count"] > 0:
+        if state["plan"][0] == NODE_TOOL and state["tool_fail_count"] > 0:
             return {
                 "step_count": step_count,
                 "plan": [],
@@ -787,46 +831,36 @@ Return ONLY valid JSON in this shape:
             }
 
         # If next plan step is TOOL but tool budget is exhausted, drop plan.
-        if state["plan"][0] == "TOOL":
-            tool_budget_exhausted = (
-                state["tool_calls"] >= state["tool_call_cap"] or
-                state["tool_latency_ms"] >= state["tool_latency_cap_ms"]
-            )
-            if tool_budget_exhausted:
-                has_evidence = bool(state["knowledge"]) or bool(state["tool_results"])
-                budget_msg = (
-                    f"[step {step_count}] {'ANSWER' if has_evidence else 'STOP'}: tool budget exhausted "
-                    f"(calls={state['tool_calls']}/{state['tool_call_cap']}, "
-                    f"latency={state['tool_latency_ms']}/{state['tool_latency_cap_ms']}ms)"
-                )
-                steps = state["reasoning_steps"] + [budget_msg]
-                if not has_evidence:
-                    steps.append("ANSWER: I couldn't complete this request because the tool budget has been exhausted.")
-                outcome = "ANSWER" if has_evidence else "STOP"
-                return {
-                    "step_count": step_count,
-                    "next": outcome,
-                    "plan": [],  # Invalidate plan
-                    "reasoning_steps": steps,
-                    "events": _event(
-                        state,
-                        type="guardrail",
-                        step=step_count,
-                        guardrail="tool_budget_exhausted",
-                        tool_calls=state["tool_calls"],
-                        tool_call_cap=state["tool_call_cap"],
-                        tool_latency_ms=state["tool_latency_ms"],
-                        tool_latency_cap_ms=state["tool_latency_cap_ms"],
-                        outcome="answer" if has_evidence else "stop",
-                    ),
-                    "decision_rationale": _rationale(
-                        state,
-                        f"Plan invalidated: next step was TOOL but budget exhausted "
-                        f"(calls={state['tool_calls']}/{state['tool_call_cap']}, "
-                        f"latency={state['tool_latency_ms']}/{state['tool_latency_cap_ms']}ms). "
-                        f"Chose {outcome} {'because fallback evidence exists' if has_evidence else 'because no fallback evidence'}."
-                    ),
-                }
+        if state["plan"][0] == NODE_TOOL and _is_tool_budget_exhausted(state):
+            has_evidence = bool(state["knowledge"]) or bool(state["tool_results"])
+            budget_status = _format_budget_status(state)
+            outcome = NODE_ANSWER if has_evidence else NODE_STOP
+            budget_msg = f"[step {step_count}] {outcome}: tool budget exhausted ({budget_status})"
+            steps = state["reasoning_steps"] + [budget_msg]
+            if not has_evidence:
+                steps.append("ANSWER: I couldn't complete this request because the tool budget has been exhausted.")
+            return {
+                "step_count": step_count,
+                "next": outcome,
+                "plan": [],  # Invalidate plan
+                "reasoning_steps": steps,
+                "events": _event(
+                    state,
+                    type="guardrail",
+                    step=step_count,
+                    guardrail="tool_budget_exhausted",
+                    tool_calls=state["tool_calls"],
+                    tool_call_cap=state["tool_call_cap"],
+                    tool_latency_ms=state["tool_latency_ms"],
+                    tool_latency_cap_ms=state["tool_latency_cap_ms"],
+                    outcome="answer" if has_evidence else "stop",
+                ),
+                "decision_rationale": _rationale(
+                    state,
+                    f"Plan invalidated: next step was TOOL but budget exhausted ({budget_status}). "
+                    f"Chose {outcome} {'because fallback evidence exists' if has_evidence else 'because no fallback evidence'}."
+                ),
+            }
 
     # =========================================================================
     # PLAN EXECUTION: Take the next planned step
@@ -838,19 +872,19 @@ Return ONLY valid JSON in this shape:
         # -----------------------------------------------------------------
         # TOOL step requires additional work: select which tool and args
         # -----------------------------------------------------------------
-        if next_step == "TOOL":
+        if next_step == NODE_TOOL:
             # Special case: math expression → use calculator directly
             plan_math_expr = _extract_math_expression(state["question"])
             if plan_math_expr:
                 max_allowed_risk = state.get("max_tool_risk", "medium")
                 return {
                     "step_count": step_count,
-                    "next": "TOOL",
+                    "next": NODE_TOOL,
                     "plan": remaining,
                     "tool_request": {"tool": "calculator", "args": {"expression": plan_math_expr}},
                     "reasoning_steps": state["reasoning_steps"]
                     + [f"[step {step_count}] PLAN step → TOOL (calculator) (remaining={remaining})"],
-                    "events": _event(state, type="plan_step", step=step_count, plan_step="TOOL", tool="calculator", remaining=remaining),
+                    "events": _event(state, type="plan_step", step=step_count, plan_step=NODE_TOOL, tool="calculator", remaining=remaining),
                     "decision_rationale": _rationale(
                         state,
                         f"Selected calculator for math expression '{plan_math_expr}' (cost=low, risk=low, latency=50ms). "
@@ -858,32 +892,9 @@ Return ONLY valid JSON in this shape:
                     ),
                 }
 
-            # Get all registered tools
-            tools_catalog = list_tools()
-
-            # ---------------------------------------------------------
-            # POLICY FILTER: Only show tools within allowed risk level
-            # ---------------------------------------------------------
-            risk_rank = {"low": 0, "medium": 1, "high": 2}
-            cost_rank = {"low": 0, "medium": 1, "high": 2}
+            # Get policy-filtered tools
+            tools_catalog = _get_policy_filtered_tools(state)
             max_allowed_risk = state.get("max_tool_risk", "medium")
-
-            # Filter out tools that exceed the risk limit
-            filtered = [
-                t for t in tools_catalog
-                if risk_rank.get(t.get("risk", "high"), 2) <= risk_rank.get(max_allowed_risk, 1)
-            ]
-
-            # Sort by cost (prefer cheaper), then latency (prefer faster), then name
-            # This biases the LLM toward efficient tool choices
-            filtered.sort(
-                key=lambda t: (
-                    cost_rank.get(t.get("cost", "high"), 2),
-                    int(t.get("latency_ms", 10_000)),
-                    t.get("name", ""),
-                )
-            )
-            tools_catalog = filtered
 
             # Ask LLM to select a specific tool and arguments
             tool_prompt = f"""
@@ -920,11 +931,11 @@ Rules:
             if not tool_name:
                 return {
                     "step_count": step_count,
-                    "next": "THINK",
+                    "next": NODE_THINK,
                     "plan": remaining,
                     "reasoning_steps": state["reasoning_steps"]
                     + [f"[step {step_count}] PLAN step TOOL failed → THINK (remaining={remaining})"],
-                    "events": _event(state, type="plan_step", step=step_count, plan_step="TOOL", fallback="THINK", remaining=remaining),
+                    "events": _event(state, type="plan_step", step=step_count, plan_step=NODE_TOOL, fallback=NODE_THINK, remaining=remaining),
                     "decision_rationale": _rationale(
                         state,
                         "Tool selection failed (LLM returned invalid tool). Chose THINK over STOP to allow reasoning and retry."
@@ -933,12 +944,12 @@ Rules:
 
             return {
                 "step_count": step_count,
-                "next": "TOOL",
+                "next": NODE_TOOL,
                 "plan": remaining,
                 "tool_request": {"tool": tool_name, "args": args},
                 "reasoning_steps": state["reasoning_steps"]
                 + [f"[step {step_count}] PLAN step → TOOL ({tool_name}) (remaining={remaining})"],
-                "events": _event(state, type="plan_step", step=step_count, plan_step="TOOL", tool=tool_name, args=args, remaining=remaining),
+                "events": _event(state, type="plan_step", step=step_count, plan_step=NODE_TOOL, tool=tool_name, args=args, remaining=remaining),
                 "decision_rationale": _rationale(
                     state,
                     f"Selected tool '{tool_name}' from {len(tools_catalog)} policy-filtered candidates "
@@ -950,9 +961,9 @@ Rules:
         # Non-TOOL steps (THINK, RETRIEVE, ANSWER) just transition directly
         # -----------------------------------------------------------------
         step_reasons = {
-            "THINK": "expanding reasoning context",
-            "RETRIEVE": f"fetching knowledge (retrieve_count={state['retrieve_count']}/{state['retrieve_cap']})",
-            "ANSWER": "sufficient evidence gathered to formulate response",
+            NODE_THINK: "expanding reasoning context",
+            NODE_RETRIEVE: f"fetching knowledge (retrieve_count={state['retrieve_count']}/{state['retrieve_cap']})",
+            NODE_ANSWER: "sufficient evidence gathered to formulate response",
         }
         return {
             "step_count": step_count,
@@ -976,7 +987,7 @@ Rules:
     if step_count >= state["max_steps"]:
         return {
             "step_count": step_count,
-            "next": "STOP",
+            "next": NODE_STOP,
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: max_steps reached"],
             "events": _event(state, type="guardrail", step=step_count, guardrail="max_steps", max_steps=state["max_steps"]),
             "decision_rationale": _rationale(
@@ -989,7 +1000,7 @@ Rules:
     if state["retrieve_count"] >= state["retrieve_cap"] and not state["knowledge"]:
         return {
             "step_count": step_count,
-            "next": "STOP",
+            "next": NODE_STOP,
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: retrieve_cap reached without evidence"],
             "events": _event(state, type="guardrail", step=step_count, guardrail="retrieve_cap", retrieve_count=state["retrieve_count"], retrieve_cap=state["retrieve_cap"]),
             "decision_rationale": _rationale(
@@ -1011,9 +1022,9 @@ Rules:
         if last_result.get("ok"):
             return {
                 "step_count": step_count,
-                "next": "ANSWER",
+                "next": NODE_ANSWER,
                 "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → ANSWER (tool succeeded)"],
-                "events": _event(state, type="routing", step=step_count, reason="tool_succeeded", next="ANSWER", tool=last_result.get("tool")),
+                "events": _event(state, type="routing", step=step_count, reason="tool_succeeded", next=NODE_ANSWER, tool=last_result.get("tool")),
             }
 
     # =========================================================================
@@ -1023,7 +1034,7 @@ Rules:
     if fallback_math_expr:
         return {
             "step_count": step_count,
-            "next": "TOOL",
+            "next": NODE_TOOL,
             "tool_request": {"tool": "calculator", "args": {"expression": fallback_math_expr}},
             "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → TOOL (calculator)"],
             "events": _event(state, type="tool_request", step=step_count, tool="calculator", expression=fallback_math_expr),
@@ -1036,15 +1047,7 @@ Rules:
     # The LLM chooses between THINK, RETRIEVE, TOOL, ANSWER, or STOP.
 
     # Get policy-filtered tools for the prompt
-    tools_catalog = list_tools()
-    risk_rank = {"low": 0, "medium": 1, "high": 2}
-    cost_rank = {"low": 0, "medium": 1, "high": 2}
-    max_allowed_risk = state.get("max_tool_risk", "medium")
-
-    # Filter and sort tools by policy
-    filtered = [t for t in tools_catalog if risk_rank.get(t.get("risk", "high"), 2) <= risk_rank.get(max_allowed_risk, 1)]
-    filtered.sort(key=lambda t: (cost_rank.get(t.get("cost", "high"), 2), int(t.get("latency_ms", 10_000)), t.get("name", "")))
-    tools_catalog = filtered
+    tools_catalog = _get_policy_filtered_tools(state)
 
     # Ask LLM for routing decision
     prompt = f"""
@@ -1065,7 +1068,7 @@ Return ONLY valid JSON in exactly this shape:
     except Exception:
         # JSON parse failed - use safe fallback
         # If we don't have knowledge and can still retrieve, try RETRIEVE; otherwise STOP
-        fallback_next = "RETRIEVE" if (not state["knowledge"] and state["retrieve_count"] < state["retrieve_cap"]) else "STOP"
+        fallback_next = NODE_RETRIEVE if (not state["knowledge"] and state["retrieve_count"] < state["retrieve_cap"]) else NODE_STOP
         return {
             "step_count": step_count,
             "next": fallback_next,
@@ -1079,9 +1082,9 @@ Return ONLY valid JSON in exactly this shape:
         }
 
     # Execute the LLM's decision
-    nxt = decision.get("next", "STOP")
+    nxt = decision.get("next", NODE_STOP)
     tool_info = ""
-    if nxt == "TOOL":
+    if nxt == NODE_TOOL:
         tool_info = f" Tool: {decision.get('tool', 'unknown')}."
 
     update: Dict[str, Any] = {
