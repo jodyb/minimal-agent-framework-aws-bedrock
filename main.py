@@ -20,7 +20,7 @@ def main() -> None:
     state: LGState = {
         # --- Core task ---
         "question": question,           # The user's input question or task
-        "next": "THINK",                # Which node to execute next (starts with THINK)
+        "next": "THINK",                # Placeholder; REASON node sets the actual routing
 
         # --- Step limits (prevents infinite loops) ---
         "step_count": 0,                # Current number of steps taken
