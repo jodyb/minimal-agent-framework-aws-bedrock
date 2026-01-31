@@ -1,15 +1,20 @@
 import sys
+import time
+import uuid
+
+
 # Add "src" directory to the module search path so we can import from src/agent/
 sys.path.insert(0, "src")
 
-# Import the graph builder, output formatter, and state type definition
+# Import the graph builder, output formatter, trace export, and state type definition
 from agent.lg_graph import build_graph
 from agent.pretty_print import pretty_print_run
+from agent.trace import export_trace
 from agent.lg_state import LGState
 
 def main() -> None:
     # The question/task for the agent to solve (modify this to test different inputs)
-    question = "What is 2 plus 2?"  # change me
+    question = "What is an agent?"  # change me
 
     # Initialize the agent's state dictionary with all required fields
     state: LGState = {
@@ -27,7 +32,7 @@ def main() -> None:
         # --- Knowledge retrieval ---
         "knowledge": [],                # Retrieved knowledge/context chunks
         "retrieve_count": 0,            # Number of retrieval operations performed
-        "retrieve_cap": 2,              # Maximum retrieval operations allowed
+        "retrieve_cap": 1,              # Maximum retrieval operations allowed
 
         # --- Tool execution ---
         "tool_request": None,           # Current tool call request from the LLM
@@ -63,8 +68,9 @@ def main() -> None:
         # --- Observability: control-plane decision events ---
         "events": [],                    # Log of key decision events for auditing/debugging
 
-        # --- Decision rationale ---
-        "decision_rationale": []        # Justifications for key decisions made
+        # --- Trace metadata ---
+        "run_id": str(uuid.uuid4()),    # Unique ID for this agent run/session
+        "started_at": time.time(),      # Timestamp when the run started
     }
 
     # Build the LangGraph state machine (nodes + edges)
@@ -73,6 +79,10 @@ def main() -> None:
     final_state = graph.invoke(state)
     # Display a formatted summary of the agent's execution
     pretty_print_run(final_state)
+
+    # Export the trace to JSON for later analysis
+    trace_path = export_trace(final_state)
+    print(f"\n[Trace exported to {trace_path}]")
 
 # Standard Python idiom: only run main() if this file is executed directly
 if __name__ == "__main__":

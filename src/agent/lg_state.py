@@ -86,18 +86,33 @@ class LGState(TypedDict):
     tool_latency_cap_ms: int  # Max total latency budget (stops slow tool chains)
 
     # -------------------------------------------------------------------------
-    # OBSERVABILITY: control-plane decision events
+    # OBSERVABILITY: Structured Execution Trace
     # -------------------------------------------------------------------------
-    # Record why the agent made key decisions for auditing/debugging
-    # Focus on high-level decisions: tool selection, retrievals, stopping, etc.
-    # Sample event {"type": "decision", "step": 7, "action": "TOOL","reason": "calculator selected (low cost, low risk)"}
-    events: List[Dict[str, Any]]  
+    # The events list provides a complete trace of agent execution.
+    # Each event is a dict with at minimum: type, step, ts_ms
+    #
+    # Event types include:
+    #   - llm_call: LLM invocation (purpose, duration_ms, token estimates)
+    #   - plan_created: Short-horizon plan generated
+    #   - plan_step: Execution of a planned step
+    #   - plan_invalidated: Plan dropped due to changed conditions
+    #   - tool_request: Tool call initiated
+    #   - tool_executed: Tool execution result (ok, output, error)
+    #   - think_complete: THINK node output (mode, preview)
+    #   - retrieve_complete: Documents retrieved (count, previews)
+    #   - memory_compressed: Memory summarization triggered
+    #   - routing: Control flow decision
+    #   - guardrail: Safety limit triggered
+    #   - rationale: Human-readable explanation of a decision
+    #
+    # Events are emitted via helpers in lg_nodes.py: _event(), _rationale(), _llm_call()
+    # Events are formatted for display by pretty_print.py
+    events: List[Dict[str, Any]]
 
     # -------------------------------------------------------------------------
-    # DECISION RATIONALE: why a choice was made (append only)
+    # TRACE METADATA
     # -------------------------------------------------------------------------
-    # Example: Chose TOOL over RETRIEVE because cost=low, latency=fast, and computation was required.
-    # Example: Skipped TOOL because latency budget was insufficient; answering best-effort.
-    decision_rationale: List[str]
+    run_id: str       # Unique ID for this agent run/session
+    started_at: float # Unix timestamp when run started (anchors ts_ms in events)
 
     
