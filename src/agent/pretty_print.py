@@ -175,3 +175,15 @@ def pretty_print_run(final_state: Dict[str, Any]) -> None:
                 print(f"  - {formatted}")
         prev_ts = step_ts
 
+    # Compact summary
+    outcome = final_state.get("next", "?")
+    steps = final_state.get("step_count", 0)
+    tool_calls = final_state.get("tool_calls", 0)
+    tool_cap = final_state.get("tool_call_cap", 0)
+    latency = final_state.get("tool_latency_ms", 0)
+    latency_cap = final_state.get("tool_latency_cap_ms", 0)
+    tool_fails = final_state.get("tool_fail_count", 0)
+    retrieves = final_state.get("retrieve_count", 0)
+
+    print(f"\n--- {outcome} | {steps} steps | tools: {tool_calls}/{tool_cap} | latency: {latency}/{latency_cap}ms | fails: {tool_fails} | retrieves: {retrieves} ---")
+
