@@ -31,3 +31,6 @@ credentials
 
 # Logs
 *.log
+
+# Trace exports
+runs/
