@@ -715,28 +715,19 @@ def reason_node(state: LGState) -> Dict[str, Any]:
     # Detect expressions like "2+2", "10 / 5", "(3 + 4) * 2"
     # Also handles natural language: "What is 2 plus 2?"
     # This avoids the overhead of planning for trivial calculations
+    # NOTE: Skip fast-path if tool failed - let repair logic handle it
     math_expr = _extract_math_expression(state["question"])
-    if math_expr:
-        # If we already have a calculator result, check outcome
+    if math_expr and state["tool_fail_count"] == 0:
+        # If calculator succeeded, go to ANSWER
         if state["tool_results"]:
             last = state["tool_results"][-1]
-            if last.get("tool") == "calculator":
-                if last.get("ok"):
-                    # Calculator succeeded - go to ANSWER
-                    return {
-                        "step_count": step_count,
-                        "next": NODE_ANSWER,
-                        "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → ANSWER (calculator done)"],
-                        "events": _event(state, type="routing", step=step_count, reason="calculator_done", next=NODE_ANSWER),
-                    }
-                else:
-                    # Calculator failed (e.g., division by zero) - stop
-                    return {
-                        "step_count": step_count,
-                        "next": NODE_STOP,
-                        "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] STOP: calculator error"],
-                        "events": _event(state, type="guardrail", step=step_count, guardrail="calculator_error", error=last.get("output", {}).get("error")),
-                    }
+            if last.get("tool") == "calculator" and last.get("ok"):
+                return {
+                    "step_count": step_count,
+                    "next": NODE_ANSWER,
+                    "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] REASON → ANSWER (calculator done)"],
+                    "events": _event(state, type="routing", step=step_count, reason="calculator_done", next=NODE_ANSWER),
+                }
 
         # No result yet - check budget then call calculator
         if _is_tool_budget_exhausted(state):

@@ -159,7 +159,11 @@ def _format_event(evt: Dict[str, Any]) -> str | None:
         return f"{evt_type.upper()}: {detail_str}"
 
 def pretty_print_run(final_state: Dict[str, Any]) -> None:
-    # Extract and display the answer prominently at the top
+    # Show the question first
+    print(f"\n=== QUESTION ===")
+    print(final_state.get("question", "(no question)"))
+
+    # Extract and display the answer
     print("\n=== ANSWER ===")
     answer = None
 
