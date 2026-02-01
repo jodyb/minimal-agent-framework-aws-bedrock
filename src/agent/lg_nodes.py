@@ -373,11 +373,24 @@ def think_node(state: LGState) -> Dict[str, Any]:
     # REPAIR MODE: Fix a failed tool call
     # -------------------------------------------------------------------------
     if state.get("last_error"):
+        # Get available tools for context
+        tools_catalog = _get_policy_filtered_tools(state)
+        failed_request = state.get("tool_request") or {}
+
         prompt = f"""
-You are repairing a tool call after a failure.
-Last error: {state['last_error']}
+You are repairing a failed tool call.
+
+Question: {state["question"]}
+Failed tool: {failed_request.get("tool", "unknown")}
+Failed args: {failed_request.get("args", {})}
+Error: {state['last_error']}
+
+Available tools:
+{tools_catalog}
+
+If the error is unfixable (e.g., division by zero, invalid input), return empty tool.
 Return ONLY valid JSON:
-{{"tool": "", "args": {{}}}}
+{{"tool": "tool_name_or_empty", "args": {{}}}}
 """
         raw, llm_event = _llm_call(state, "tool_repair", prompt, step)
         raw = raw.strip()
@@ -632,6 +645,19 @@ def answer_node(state: LGState) -> Dict[str, Any]:
         State updates: reasoning_steps (with answer)
     """
     # -------------------------------------------------------------------------
+    # Check if a repair occurred (look for repair=True in events)
+    # -------------------------------------------------------------------------
+    repair_warning = ""
+    for evt in state.get("events", []):
+        if evt.get("type") == "tool_request" and evt.get("repair"):
+            original_expr = _extract_math_expression(state["question"])
+            repaired_args = evt.get("args", {})
+            repaired_expr = repaired_args.get("expression", "")
+            if original_expr and repaired_expr and original_expr != repaired_expr:
+                repair_warning = f" (Note: Original expression '{original_expr}' was repaired to '{repaired_expr}' due to an error.)"
+            break
+
+    # -------------------------------------------------------------------------
     # Priority 1: Use tool results if available
     # -------------------------------------------------------------------------
     if state["tool_results"]:
@@ -639,7 +665,7 @@ def answer_node(state: LGState) -> Dict[str, Any]:
         # For calculator, format the numeric result
         if last.get("tool") == "calculator" and last.get("ok"):
             return {
-                "reasoning_steps": state["reasoning_steps"] + [f"ANSWER: The result is {last['output']['result']}."],
+                "reasoning_steps": state["reasoning_steps"] + [f"ANSWER: The result is {last['output']['result']}.{repair_warning}"],
             }
 
     # -------------------------------------------------------------------------
