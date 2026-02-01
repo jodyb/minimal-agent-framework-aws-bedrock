@@ -56,6 +56,31 @@ def group_events_by_step(events: List[Dict[str, Any]]) -> Dict[int, List[Dict[st
         grouped[step].append(evt)
     return dict(sorted(grouped.items()))
 
+
+def _infer_node(events: List[Dict[str, Any]]) -> str:
+    """Infer which node executed based on event types."""
+    for evt in events:
+        evt_type = evt.get("type", "")
+        if evt_type == "node_entry":
+            return evt.get("node", "?")
+        # REASON emits these
+        if evt_type in ("routing", "guardrail", "plan_step", "plan_invalidated", "tool_request"):
+            return "REASON"
+        if evt_type == "llm_call" and evt.get("purpose") == "plan_generation":
+            return "REASON"
+        # THINK emits these
+        if evt_type == "think_complete":
+            return "THINK"
+        if evt_type == "llm_call" and evt.get("purpose") in ("chain_of_thought", "tool_repair"):
+            return "THINK"
+        # RETRIEVE emits this
+        if evt_type == "retrieve_complete":
+            return "RETRIEVE"
+        # TOOL emits this
+        if evt_type == "tool_executed":
+            return "TOOL"
+    return "?"
+
 def _short(s: str, n: int = 140) -> str:
     s = (s or "").replace("\n", " ").strip()
     return s if len(s) <= n else s[: n - 3] + "..."
@@ -168,7 +193,8 @@ def pretty_print_run(final_state: Dict[str, Any]) -> None:
         step_ts = step_events[0].get("ts_ms", 0) if step_events else 0
         delta = step_ts - prev_ts if prev_ts else 0
         timing_str = f" (+{delta}ms)" if delta > 0 else ""
-        print(f"\nStep {step}:{timing_str}")
+        node = _infer_node(step_events)
+        print(f"\nStep {step} [{node}]:{timing_str}")
         for evt in step_events:
             formatted = _format_event(evt)
             if formatted:

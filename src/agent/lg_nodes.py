@@ -197,6 +197,11 @@ def _event(state: LGState, **e: Any) -> list[dict[str, Any]]:
     return (state.get("events") or []) + [e]
 
 
+def _node_entry(state: LGState, node: str, step: int) -> list[dict[str, Any]]:
+    """Emit a node_entry event to mark which node is executing."""
+    return _event(state, type="node_entry", node=node, step=step)
+
+
 def _rationale(state: LGState, step: int, text: str, events: list = None) -> list[dict[str, Any]]:
     """
     Emit a rationale event explaining WHY a decision was made.
@@ -360,9 +365,9 @@ def think_node(state: LGState) -> Dict[str, Any]:
     allows the agent to reason about the problem before taking action.
 
     Returns:
-        State updates: think_count, reasoning_steps, and possibly repaired_tool_request
+        State updates: step_count, think_count, reasoning_steps, and possibly repaired_tool_request
     """
-    step = state["step_count"]
+    step = state["step_count"] + 1
 
     # -------------------------------------------------------------------------
     # REPAIR MODE: Fix a failed tool call
@@ -384,8 +389,9 @@ Return ONLY valid JSON:
             repaired = {"tool": "", "args": {}}
 
         return {
+            "step_count": step,
             "think_count": state["think_count"] + 1,
-            "reasoning_steps": state["reasoning_steps"] + [f"THINK (repair) last_error={state['last_error']}"],
+            "reasoning_steps": state["reasoning_steps"] + [f"[step {step}] THINK (repair) last_error={state['last_error']}"],
             "repaired_tool_request": repaired if repaired.get("tool") else None,
             "events": (state.get("events") or []) + [
                 llm_event,
@@ -401,8 +407,9 @@ Return ONLY valid JSON:
     notes = notes.strip()
 
     return {
+        "step_count": step,
         "think_count": state["think_count"] + 1,
-        "reasoning_steps": state["reasoning_steps"] + [notes],
+        "reasoning_steps": state["reasoning_steps"] + [f"[step {step}] {notes}"],
         "events": (state.get("events") or []) + [
             llm_event,
             {"type": "think_complete", "step": step, "mode": "reasoning", "output_preview": notes[:100], "ts_ms": _ts_ms(state)},
@@ -427,9 +434,9 @@ def retrieve_node(state: LGState) -> Dict[str, Any]:
     In production, replace it with a real vector store for semantic search.
 
     Returns:
-        State updates: retrieve_count, knowledge, reasoning_steps
+        State updates: step_count, retrieve_count, knowledge, reasoning_steps
     """
-    step = state["step_count"]
+    step = state["step_count"] + 1
     start = time.time()
 
     # Query the retrieval system for relevant documents
@@ -441,9 +448,10 @@ def retrieve_node(state: LGState) -> Dict[str, Any]:
     doc_previews = [d.get("text", "")[:50] for d in docs] if docs else []
 
     return {
+        "step_count": step,
         "retrieve_count": state["retrieve_count"] + 1,  # Track retrieval calls
         "knowledge": state["knowledge"] + docs,         # Accumulate knowledge
-        "reasoning_steps": state["reasoning_steps"] + [f"RETRIEVE got {len(docs)} docs"],
+        "reasoning_steps": state["reasoning_steps"] + [f"[step {step}] RETRIEVE got {len(docs)} docs"],
         "events": _event(
             state,
             type="retrieve_complete",
@@ -557,9 +565,11 @@ def tool_node(state: LGState) -> Dict[str, Any]:
     # -------------------------------------------------------------------------
     # Build state updates
     # -------------------------------------------------------------------------
+    step = state["step_count"] + 1
     updates: Dict[str, Any] = {
+        "step_count": step,
         "tool_results": state["tool_results"] + [result],  # Append result to history
-        "reasoning_steps": state["reasoning_steps"] + [f"TOOL ran: {result.get('tool')} (ok={result.get('ok')})"],
+        "reasoning_steps": state["reasoning_steps"] + [f"[step {step}] TOOL ran: {result.get('tool')} (ok={result.get('ok')})"],
         "tool_request": None,     # Clear the request (it's been processed)
         "last_error": last_error,  # Set error message (or None if success)
     }
@@ -583,7 +593,7 @@ def tool_node(state: LGState) -> Dict[str, Any]:
     updates["events"] = _event(
         state,
         type="tool_executed",
-        step=state["step_count"],
+        step=step,
         tool=tool_name or "(none)",
         args=args,
         ok=result.get("ok", False),
@@ -896,10 +906,13 @@ Return ONLY valid JSON in this shape:
 
         if plan:
             base_events = (state.get("events") or []) + [llm_event]
+            first_step = plan[0]
+            remaining = plan[1:]
             return {
                 "step_count": step_count,
-                "plan": plan,
-                "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] PLAN created: {plan}"],
+                "next": first_step,
+                "plan": remaining,
+                "reasoning_steps": state["reasoning_steps"] + [f"[step {step_count}] PLAN created: {plan} → {first_step}"],
                 "events": _rationale(
                     state,
                     step_count,
