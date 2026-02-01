@@ -1,7 +1,8 @@
 from typing import Any, Dict, List, Optional, Literal
 # TypedDict lets us define a dictionary with specific keys and value types
 # This gives us type checking while still using a PLAIN DICT AT RUNTIME
-from typing_extensions import TypedDict
+# NotRequired marks fields that don't need to be present in the initial state
+from typing_extensions import TypedDict, NotRequired
 
 
 class LGState(TypedDict):
@@ -21,8 +22,8 @@ class LGState(TypedDict):
     # -------------------------------------------------------------------------
     # CONTROL FLOW (state machine routing)
     # -------------------------------------------------------------------------
-    # Which node should execute next; this is how the graph routes between nodes
-    next: Literal["THINK", "RETRIEVE", "TOOL", "ANSWER", "STOP"]
+    # Which node should execute next; set by REASON node, not needed in initial state
+    next: NotRequired[Literal["THINK", "RETRIEVE", "TOOL", "ANSWER", "STOP"]]
     step_count: int   # How many steps have been taken so far
     max_steps: int    # Hard limit to prevent infinite loops
 

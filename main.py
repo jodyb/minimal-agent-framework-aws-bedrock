@@ -14,13 +14,12 @@ from agent.lg_state import LGState
 
 def main() -> None:
     # The question/task for the agent to solve (modify this to test different inputs)
-    question = "What is an agent?"  # change me
+    question = "What is langgraph?"  # change me
 
     # Initialize the agent's state dictionary with all required fields
     state: LGState = {
         # --- Core task ---
         "question": question,           # The user's input question or task
-        "next": "THINK",                # Placeholder; REASON node sets the actual routing
 
         # --- Step limits (prevents infinite loops) ---
         "step_count": 0,                # Current number of steps taken
@@ -44,7 +43,6 @@ def main() -> None:
         # --- Tool budget ---
         "tool_calls": 0,
         "tool_call_cap": 5,
-
         "tool_latency_ms": 0,
         "tool_latency_cap_ms": 10,
 
